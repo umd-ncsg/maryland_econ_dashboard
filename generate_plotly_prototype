@@ -1,0 +1,256 @@
+"""
+generate_plotly_dash.py
+----------------------------------
+Standalone Dash application to visualize Maryland county metrics
+generated from the FRED API pipeline (fred_api.py).
+
+Features:
+- County dropdown (auto-detected from county_data folders)
+- Metric category dropdown (housing, labor, economy)
+- Stacked Plotly subplots for all metrics in a category
+- No Jupyter dependencies
+
+Run with:
+    python generate_plotly_dash.py
+"""
+
+import os
+import re
+from pathlib import Path
+
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+from dash import Dash, html, dcc
+from dash.dependencies import Input, Output
+
+
+# ---------------------------------------------------------------
+# 1. LOCATE DATA DIRECTORIES (compatible with fred_api.py output)
+# ---------------------------------------------------------------
+
+BASE_DIR = Path(__file__).resolve().parent
+
+POSSIBLE_ROOTS = ["fred_csv_outputs", "csv_outputs"]
+
+county_base_dir = None
+for root in POSSIBLE_ROOTS:
+    candidate = BASE_DIR / root / "county_data"
+    if candidate.exists():
+        county_base_dir = candidate
+        break
+
+if county_base_dir is None:
+    raise FileNotFoundError(
+        f"❌ ERROR: Could not find county_data folder in {BASE_DIR}.\n"
+        "Expected:\n"
+        "  fred_csv_outputs/county_data   OR\n"
+        "  csv_outputs/county_data\n"
+        "Make sure your FRED API script saved the CSVs correctly."
+    )
+
+
+# ---------------------------------------------------------------
+# 2. STRING HELPERS
+# ---------------------------------------------------------------
+
+def to_snake_case(s: str) -> str:
+    s = s.lower()
+    s = re.sub(r"[ /\\\-]", "_", s)
+    s = re.sub(r"[^a-z0-9_]", "", s)
+    s = re.sub(r"_+", "_", s)
+    return s.strip("_")
+
+
+def pretty_label(metric: str) -> str:
+    return metric.replace("_", " ").title()
+
+
+# ---------------------------------------------------------------
+# 3. AUTO-DETECT COUNTIES + METRIC NAMES
+# ---------------------------------------------------------------
+
+all_county_folders = sorted([d.name for d in county_base_dir.iterdir() if d.is_dir()])
+
+if not all_county_folders:
+    raise RuntimeError("❌ ERROR: No county folders found inside county_data.")
+
+# Convert folder names back to readable names
+county_list = [c.replace("_", " ").title() for c in all_county_folders]
+
+
+# Extract metric names based on CSV file naming convention
+metric_set = set()
+for cfolder in all_county_folders:
+    for file in (county_base_dir / cfolder).glob("*.csv"):
+        # Filename example: allegany_resident_population_thousands_persons.csv
+        raw = file.stem.split(f"{cfolder}_", 1)
+        if len(raw) == 2:
+            metric_set.add(raw[1])
+
+metric_list = sorted(metric_set)
+
+
+# ---------------------------------------------------------------
+# 4. GROUP METRICS INTO SUBJECT AREAS
+# ---------------------------------------------------------------
+
+group_patterns = {
+    "housing": re.compile(r"house|housing|price|zillow", re.IGNORECASE),
+    "labor": re.compile(r"labor|employ|unemploy|civilian", re.IGNORECASE),
+    "economy": re.compile(r"gdp|income|business|poverty|population", re.IGNORECASE),
+}
+
+metric_to_group = {}
+for metric in metric_list:
+    assigned = False
+    for group, pattern in group_patterns.items():
+        if pattern.search(metric):
+            metric_to_group[metric] = group
+            assigned = True
+            break
+    if not assigned:
+        # If metric does not match any pattern, label it "other"
+        metric_to_group[metric] = "other"
+
+
+# ---------------------------------------------------------------
+# 5. LOAD DATA FOR A COUNTY + GROUP
+# ---------------------------------------------------------------
+
+def load_group_data(county_pretty: str, group: str) -> pd.DataFrame:
+    county_folder = to_snake_case(county_pretty)
+    full_path = county_base_dir / county_folder
+
+    if not full_path.exists():
+        raise FileNotFoundError(f"County folder not found: {full_path}")
+
+    frames = []
+    for metric, metric_group in metric_to_group.items():
+        if metric_group != group:
+            continue
+
+        csv_path = full_path / f"{county_folder}_{metric}.csv"
+        if not csv_path.exists():
+            continue
+
+        df = pd.read_csv(csv_path)
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"])
+
+        df["metric"] = pretty_label(metric)
+        frames.append(df[["date", "value", "metric"]])
+
+    if not frames:
+        raise ValueError(f"No metrics in group '{group}' for {county_pretty}")
+
+    return pd.concat(frames, ignore_index=True)
+
+
+# ---------------------------------------------------------------
+# 6. BUILD FIGURE
+# ---------------------------------------------------------------
+
+def make_figure(df: pd.DataFrame, county_pretty: str, group: str):
+    metrics = sorted(df["metric"].unique())
+    rows = len(metrics)
+
+    fig = make_subplots(
+        rows=rows, cols=1,
+        shared_xaxes=True,
+        subplot_titles=metrics,
+        vertical_spacing=0.07
+    )
+
+    for i, m in enumerate(metrics, start=1):
+        d = df[df["metric"] == m]
+        fig.add_trace(
+            go.Scatter(
+                x=d["date"],
+                y=d["value"],
+                mode="lines+markers",
+                name=m,
+                showlegend=False,
+                hovertemplate="<b>%{fullData.name}</b><br>Date: %{x}<br>Value: %{y}<extra></extra>"
+            ),
+            row=i, col=1
+        )
+        fig.update_yaxes(title_text="Value", row=i, col=1)
+
+    fig.update_xaxes(title_text="Date", row=rows, col=1)
+    fig.update_layout(
+        height=rows * 260,
+        title=f"{county_pretty} — {group.title()} Metrics",
+        margin=dict(t=80, b=40)
+    )
+    return fig
+
+
+# ---------------------------------------------------------------
+# 7. DASH APP
+# ---------------------------------------------------------------
+
+app = Dash(__name__)
+
+group_list = ["housing", "labor", "economy"]
+
+app.layout = html.Div(
+    style={"fontFamily": "Arial", "maxWidth": "1100px", "margin": "0 auto"},
+    children=[
+        html.H1("Maryland County Metrics Dashboard"),
+
+        html.Div([
+            html.Div([
+                html.Label("Select County:"),
+                dcc.Dropdown(
+                    id="county_dd",
+                    options=[{"label": c, "value": c} for c in county_list],
+                    value=county_list[0],
+                    clearable=False
+                ),
+            ], style={"width": "48%", "display": "inline-block"}),
+
+            html.Div([
+                html.Label("Select Metric Category:"),
+                dcc.Dropdown(
+                    id="group_dd",
+                    options=[{"label": g.title(), "value": g} for g in group_list],
+                    value="economy",
+                    clearable=False
+                ),
+            ], style={"width": "48%", "display": "inline-block", "float": "right"}),
+        ], style={"marginBottom": "20px"}),
+
+        dcc.Graph(id="main_graph"),
+
+        html.Div("Data Source: FRED • Visualization: Plotly Dash", 
+                 style={"marginTop": "10px", "fontSize": "0.9rem", "color": "#555"})
+    ]
+)
+
+
+@app.callback(
+    Output("main_graph", "figure"),
+    Input("county_dd", "value"),
+    Input("group_dd", "value")
+)
+def update_graph(selected_county, selected_group):
+    try:
+        df = load_group_data(selected_county, selected_group)
+        return make_figure(df, selected_county, selected_group)
+    except Exception as e:
+        fig = go.Figure()
+        fig.add_annotation(
+            x=0.5, y=0.5,
+            text=str(e),
+            showarrow=False,
+            font=dict(size=16)
+        )
+        fig.update_layout(height=300)
+        return fig
+
+
+if __name__ == "__main__":
+    print(f"📁 Using data directory: {county_base_dir}")
+    app.run(debug=True)
